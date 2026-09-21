@@ -21,7 +21,7 @@ import sys
 import time
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 # ----------------------------------------------------------------------------
 # CONFIG  -  check the pin block against adsb_radar_display.py
@@ -170,8 +170,13 @@ class Eye:
         self.pupils = [make_iris(PUPIL_MIN + (PUPIL_MAX - PUPIL_MIN) * i / (PUPIL_STEPS - 1))
                        for i in range(PUPIL_STEPS)]
         self.highlight = make_highlight()
-        self.vignette = make_vignette()
-        self.lids = [make_lid_mask(i / (LID_STEPS - 1)) for i in range(LID_STEPS)]
+        # eyelid mask + edge-darkening vignette merged into one mask per lid level
+        vig = np.asarray(make_vignette().getchannel("A"), dtype=np.uint16)
+        self.lids = []
+        for i in range(LID_STEPS):
+            lm = np.asarray(make_lid_mask(i / (LID_STEPS - 1)), dtype=np.uint16)
+            comb = 255 - ((255 - lm) * (255 - vig)) // 255
+            self.lids.append(Image.fromarray(comb.astype(np.uint8), "L"))
 
         self.gx = self.gy = 0.0            # current gaze (unit disk)
         self.tx = self.ty = 0.0            # target gaze
@@ -234,8 +239,7 @@ class Eye:
     # -- drawing -----------------------------------------------------------
     def render(self):
         t = self.t
-        gx = self.gx + 0.012 * math.sin(t * 9.1)          # tiny tremor
-        gy = self.gy + 0.012 * math.sin(t * 7.3 + 1)
+        gx, gy = self.gx, self.gy
         m = math.hypot(gx, gy)
         if m > 1:
             gx, gy = gx / m, gy / m
@@ -251,14 +255,27 @@ class Eye:
         hx = int(CX - 40 + gx * MAX_OFFSET * 0.35)
         hy = int(CY - 46 + gy * MAX_OFFSET * 0.35)
         frame.paste(self.highlight, (hx - 24, hy - 24), self.highlight)
-        frame.paste(self.vignette, (0, 0), self.vignette)
 
         openness = 0.96 - 0.12 * max(0.0, gy)               # lids droop when looking down
         openness *= self._blink_openness()
         li = int(np.clip(round(openness * (LID_STEPS - 1)), 0, LID_STEPS - 1))
-        if li < LID_STEPS - 1:
-            frame.paste(LID_COLOR, (0, 0, W, H), self.lids[li])
+        frame.paste(LID_COLOR, (0, 0, W, H), self.lids[li])   # lids + vignette
         return frame
+
+
+# RGB888 -> RGB565 (big-endian, as the GC9A01A wants) using only Pillow's C
+# routines: much cheaper on a Pi Zero than doing the bit-twiddling in numpy.
+_LUT_R = [v & 0xF8 for v in range(256)]
+_LUT_GH = [v >> 5 for v in range(256)]
+_LUT_GL = [(v << 3) & 0xE0 for v in range(256)]
+_LUT_B = [v >> 3 for v in range(256)]
+
+
+def to_rgb565(img):
+    r, g, b = img.split()
+    hi = ImageChops.add(r.point(_LUT_R), g.point(_LUT_GH))
+    lo = ImageChops.add(g.point(_LUT_GL), b.point(_LUT_B))
+    return Image.merge("LA", (hi, lo)).tobytes()
 
 
 # ----------------------------------------------------------------------------
@@ -283,19 +300,28 @@ class Panel:
         self.display = adafruit_gc9a01a.GC9A01A(
             self.bus, width=W, height=H, auto_refresh=False
         )
+        self.t_conv = self.t_spi = 0.0
         self._bl = None
         if BL_PIN:
             import digitalio
             self._bl = digitalio.DigitalInOut(getattr(board, BL_PIN))
             self._bl.switch_to_output(value=True)
 
-    def show(self, img):
-        a = np.asarray(img, dtype=np.uint16)
-        rgb565 = ((a[..., 0] & 0xF8) << 8) | ((a[..., 1] & 0xFC) << 3) | (a[..., 2] >> 3)
-        buf = rgb565.astype(">u2").tobytes()
-        self.bus.send(0x2A, b"\x00\x00\x00\xEF")   # column 0..239
-        self.bus.send(0x2B, b"\x00\x00\x00\xEF")   # row    0..239
+    def show(self, img, box=None):
+        """Send img (or just the sub-rectangle box=(x0,y0,x1,y1)) to the panel."""
+        if box is None:
+            box = (0, 0, W, H)
+        x0, y0, x1, y1 = box
+        t0 = time.monotonic()
+        buf = to_rgb565(img.crop(box))
+        t1 = time.monotonic()
+        self.bus.send(0x2A, bytes([x0 >> 8, x0 & 255, (x1 - 1) >> 8, (x1 - 1) & 255]))
+        self.bus.send(0x2B, bytes([y0 >> 8, y0 & 255, (y1 - 1) >> 8, (y1 - 1) & 255]))
         self.bus.send(0x2C, buf)                   # RAMWR
+        t2 = time.monotonic()
+        self.t_conv += t1 - t0
+        self.t_spi += t2 - t1
+        return (x1 - x0) * (y1 - y0)
 
 
 # ----------------------------------------------------------------------------
@@ -318,13 +344,10 @@ def main():
         for i, o in enumerate([0.75, 0.45, 0.2, 0.05]):
             eye.gx = eye.gy = 0.1
             eye.blink_t = None
-            f = eye.sclera.copy()
-            f = eye.render()
             li = int(round(o * (LID_STEPS - 1)))
             f2 = eye.sclera.copy()
             iris = eye.pupils[3]
             f2.paste(iris, (CX - iris.width // 2, CY - iris.height // 2), iris)
-            f2.paste(eye.vignette, (0, 0), eye.vignette)
             f2.paste(LID_COLOR, (0, 0, W, H), eye.lids[li])
             sheet.paste(f2, (i * W, H))
         sheet.save("eye_preview.png")
@@ -334,18 +357,44 @@ def main():
     panel = Panel()
     frame_time = 1.0 / TARGET_FPS
     last = time.monotonic()
-    frames, fps_t = 0, last
+    prev = None
+    n = sent = 0
+    t_upd = t_diff = t_send = 0.0
+    px = 0
+    stat_t = last
     try:
         while True:
             now = time.monotonic()
             dt = min(now - last, 0.1)
             last = now
+
+            a = time.monotonic()
             eye.update(dt)
-            panel.show(eye.render())
-            frames += 1
-            if show_fps and now - fps_t >= 5:
-                print("%.1f fps" % (frames / (now - fps_t)))
-                frames, fps_t = 0, now
+            frame = eye.render()
+            b = time.monotonic()
+            box = None if prev is None else ImageChops.difference(prev, frame).getbbox()
+            c = time.monotonic()
+            if prev is None or box is not None:
+                px += panel.show(frame, box)
+                sent += 1
+            prev = frame
+            d = time.monotonic()
+
+            n += 1
+            t_upd += b - a
+            t_diff += c - b
+            t_send += d - c
+            if show_fps and d - stat_t >= 5:
+                k = max(sent, 1)
+                print("%4.1f loops/s | drawn %d/%d | render %.0f ms  diff %.0f ms | per sent frame: "
+                      "convert %.0f ms  spi %.0f ms  (%d px = %d KB, %.1f MB/s)"
+                      % (n / (d - stat_t), sent, n, 1000 * t_upd / n, 1000 * t_diff / n,
+                         1000 * panel.t_conv / k, 1000 * panel.t_spi / k, px / k, px * 2 / k / 1024,
+                         (px * 2 / 1e6) / max(panel.t_spi, 1e-9)))
+                n = sent = px = 0
+                t_upd = t_diff = t_send = 0.0
+                panel.t_conv = panel.t_spi = 0.0
+                stat_t = d
             spare = frame_time - (time.monotonic() - now)
             if spare > 0:
                 time.sleep(spare)
